@@ -115,6 +115,8 @@ function getVersionList() {
   return versionList;
 }
 
+// 交互为历史形态：聚焦隐式获取（每次挂载仅一次，失败无重试入口）、失焦触发查询。
+// 直观性局限存在，本补丁只收口失败路径，交互重构不在范围内。
 function onFetchCFFocus() {
   if (!fetched) {
     autoFillFetchID();
@@ -143,20 +145,32 @@ function onFetchMRFocusout() {
 
 async function autoFillFetchID() {
   // 自动获取 CFID / MRID
-  const resp = await parent.utils.createRequest(
-    {
-      url: `${parent.hostname}/class/edit/${document.location.href.split("/version/")[1].split(".html")[0]}/`,
-      method: "GET",
-    },
-    "从编辑页获取 CFID/MRID",
-  );
-  if (!resp.responseXML) {
-    Utils.commonMsg("CFID/MRID 获取失败...", false);
-    return;
+  // 失败必须显式收口：请求被拒、URL 形态不符、编辑页缺字段，旧实现都会静默死亡（#128）
+  try {
+    const resp = await parent.utils.createRequest(
+      {
+        url: `${parent.hostname}/class/edit/${document.location.href.split("/version/")[1].split(".html")[0]}/`,
+        method: "GET",
+      },
+      "从编辑页获取 CFID/MRID",
+    );
+    if (!resp.responseXML) {
+      Utils.commonMsg("CFID/MRID 获取失败...", false);
+      return;
+    }
+    let w = $(resp.responseXML);
+    const cf = String(w.find("#class-cfprojectid").val() ?? "").trim();
+    const mr = String(w.find("#class-mrprojectid").val() ?? "").trim();
+    fetchCF.value!.value = cf;
+    fetchMR.value!.value = mr;
+    if (!cf && !mr) {
+      // 404 页/无字段的页面 responseXML 仍是 truthy，静默填空串也是「没反应」的一种
+      Utils.commonMsg("编辑页上没有登记 CFID/MRID，请手动填写", false);
+    }
+  } catch (error) {
+    console.error("[Mcmodder] CFID/MRID 自动获取失败：", error);
+    Utils.commonMsg("CFID/MRID 自动获取失败（编辑页不可达或未登记），请手动填写", false);
   }
-  let w = $(resp.responseXML);
-  fetchCF.value!.value = w.find("#class-cfprojectid").val().trim();
-  fetchMR.value!.value = w.find("#class-mrprojectid").val().trim();
 }
 
 function parseCFFileName(e: string) {
@@ -177,7 +191,15 @@ function parseMRFileName(e: string) {
     .slice(-1)[0];
 }
 
+/** 结束加载遮罩并提示——失败不收口会让遮罩永远停留「加载中」（#128） */
+function failListLoading(message: string) {
+  table.value!.completeLoading();
+  Utils.commonMsg(message, false);
+}
+
 function getCurseForgeFileList(cfid: string) {
+  // Number("") === 0 是有限数，空输入失焦会放行空 ID 请求
+  if (!cfid) return;
   table.value!.show();
   table.value!.showLoading();
   // this.tbody.html(`<img src="${McmodderValues.assets.mcmod.loading}"></img>`);
@@ -206,6 +228,8 @@ function getCurseForgeFileList(cfid: string) {
               work(0);
             }, captchaAttemptInterval);
           } else {
+            // 重试额度用尽：结束加载遮罩，交由 swal 引导手动验证
+            table.value!.completeLoading();
             swal
               .fire({
                 title: "验证失败",
@@ -221,7 +245,18 @@ function getCurseForgeFileList(cfid: string) {
           return;
         }
 
-        let data = JSON.parse(resp.responseText);
+        let data: { pagination?: { totalCount: number }; data?: CFGameVersion[] };
+        try {
+          data = JSON.parse(resp.responseText);
+        } catch {
+          // 拦截页不止「Just a moment...」一种标题，其余非 JSON 响应在此显式失败
+          failListLoading(`CF 文件列表获取失败（HTTP ${resp.status}），响应不是有效数据`);
+          return;
+        }
+        if (!data?.pagination || !Array.isArray(data.data)) {
+          failListLoading(`CF 文件列表获取失败（HTTP ${resp.status}），响应缺少列表字段`);
+          return;
+        }
         if (index === 0) {
           table.value!.loadingProgress!.setMax(Math.ceil(data.pagination.totalCount / 50));
           table.value!.loadingProgress!.show();
@@ -272,6 +307,10 @@ function getCurseForgeFileList(cfid: string) {
           });
           table.value!.refreshAll();
         }
+      })
+      .catch((error) => {
+        // 网络失败/超时/中止（createRequest reject）与本页处理异常统一收口
+        failListLoading(error instanceof Error ? error.message : String(error));
       });
   };
   work(0);
@@ -293,7 +332,17 @@ function getModrinthFileList(mrid: string) {
         "从 MR 获取版本列表",
       )
       .then((resp) => {
-        let data = JSON.parse(resp.responseText);
+        let data: MRGameVersion[];
+        try {
+          data = JSON.parse(resp.responseText);
+        } catch {
+          failListLoading(`MR 文件列表获取失败（HTTP ${resp.status}），响应不是有效数据`);
+          return;
+        }
+        if (!Array.isArray(data)) {
+          failListLoading(`MR 文件列表获取失败（HTTP ${resp.status}），响应缺少列表字段`);
+          return;
+        }
         fileList = fileList.concat(data);
         table.value!.empty();
         fileList.forEach((i) => {
@@ -335,6 +384,9 @@ function getModrinthFileList(mrid: string) {
           });
         });
         table.value!.refreshAll();
+      })
+      .catch((error) => {
+        failListLoading(error instanceof Error ? error.message : String(error));
       });
   };
   work();
